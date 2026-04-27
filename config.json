@@ -1,0 +1,20 @@
+{
+    "days": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1
+    ],
+    "hour": 7,
+    "minute": 0,
+    "disk": "C:/",
+    "threshold": 175.0,
+    "folder": "C:/TEMP",
+    "delete_n": 2,
+    "log_path": "E:/zzzz.txt",
+    "alpha": 0.98,
+    "theme": "light"
+}
