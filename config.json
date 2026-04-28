@@ -15,6 +15,13 @@
     "folder": "C:/TEMP",
     "delete_n": 2,
     "log_path": "E:/zzzz.txt",
+    "plc_enabled": false,
+    "plc_endpoint": "",
+    "plc_username": "",
+    "plc_password": "",
+    "plc_security": "",
+    "plc_heartbeat_node": "",
+    "plc_deleting_node": "",
     "alpha": 0.98,
-    "theme": "light"
+    "theme": "dark"
 }

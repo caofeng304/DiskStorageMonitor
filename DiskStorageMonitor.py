@@ -3,12 +3,13 @@ import sys
 import json
 import base64
 import shutil
+import time
 import threading
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox, simpledialog
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict
+from typing import Any, Callable, Dict, List, Optional
 
 # ==========================================
 # 全局配置与常量
@@ -29,6 +30,16 @@ try:
 except ImportError:
     THEME_AVAILABLE = False
 
+try:
+    from asyncua import ua
+    from asyncua.sync import Client as OpcUaClient
+    HAS_OPCUA = True
+except ImportError:
+    ua = None
+    OpcUaClient = None
+    HAS_OPCUA = False
+    print("警告: 缺少 asyncua 库。PLC OPC UA 功能不可用，请运行 pip install asyncua")
+
 CONFIG_FILE = Path("config.json")
 
 
@@ -39,17 +50,290 @@ class Assets:
     TESLA_ICON_B64 = """iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAABGdB..."""
 
 
+class OpcUaSignalClient:
+    """负责与西门子 PLC 进行 OPC UA 心跳和 deleting 信号通信。"""
+
+    HEARTBEAT_INTERVAL = 1.0
+    RECONNECT_DELAY = 3.0
+
+    def __init__(self, status_callback: Optional[Callable[[str], None]] = None):
+        self.status_callback = status_callback or (lambda _text: None)
+        self._config: Dict[str, Any] = {}
+        self._client: Any = None
+        self._heartbeat_node: Any = None
+        self._deleting_node: Any = None
+        self._heartbeat_variant_type: Any = None
+        self._deleting_variant_type: Any = None
+        self._heartbeat_sample: Any = False
+        self._deleting_sample: Any = False
+        self._heartbeat_state = False
+        self._last_error = ""
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._lock = threading.RLock()
+
+    def reconfigure(self, config: Dict[str, Any]) -> bool:
+        normalized = self._normalize_config(config)
+        with self._lock:
+            changed = normalized != self._config
+            self._config = normalized
+        if changed and self.is_running():
+            self.restart()
+        return changed
+
+    def is_running(self) -> bool:
+        return bool(self._heartbeat_thread and self._heartbeat_thread.is_alive())
+
+    def start(self) -> tuple[bool, str]:
+        cfg = self._snapshot_config()
+        if not cfg.get("plc_enabled"):
+            return False, "PLC OPC UA 未启用"
+        if not HAS_OPCUA:
+            return False, "缺少 asyncua 依赖，无法启动 PLC OPC UA"
+        if not cfg.get("plc_endpoint"):
+            return False, "PLC Endpoint 未配置"
+        if not cfg.get("plc_heartbeat_node"):
+            return False, "PLC 心跳 NodeId 未配置"
+        if self.is_running():
+            return True, "PLC OPC UA 心跳已运行"
+
+        self._stop_event = threading.Event()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name="opcua-heartbeat",
+            daemon=True
+        )
+        self._heartbeat_thread.start()
+        return True, "PLC OPC UA 心跳线程已启动"
+
+    def stop(self) -> str:
+        thread = self._heartbeat_thread
+        self._stop_event.set()
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=3.0)
+        with self._lock:
+            self._safe_reset_outputs_locked()
+            self._disconnect_locked()
+            self._heartbeat_thread = None
+            self._heartbeat_state = False
+        return "PLC OPC UA 已停止"
+
+    def restart(self) -> tuple[bool, str]:
+        self.stop()
+        return self.start()
+
+    def set_deleting(self, active: bool):
+        cfg = self._snapshot_config()
+        if not (cfg.get("plc_enabled") and cfg.get("plc_deleting_node") and HAS_OPCUA):
+            return
+
+        with self._lock:
+            try:
+                self._ensure_connected_locked()
+                if self._deleting_node is None:
+                    return
+                self._write_logical_value_locked(
+                    node=self._deleting_node,
+                    variant_type=self._deleting_variant_type,
+                    sample_value=self._deleting_sample,
+                    state=active,
+                    active_text="deleting",
+                    inactive_text="idle"
+                )
+                self._last_error = ""
+            except Exception as exc:
+                self._handle_error_locked(f"PLC deleting 信号写入失败: {exc}")
+
+    def _heartbeat_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                with self._lock:
+                    self._ensure_connected_locked()
+                    self._heartbeat_state = not self._heartbeat_state
+                    self._write_logical_value_locked(
+                        node=self._heartbeat_node,
+                        variant_type=self._heartbeat_variant_type,
+                        sample_value=self._heartbeat_sample,
+                        state=self._heartbeat_state,
+                        active_text="1",
+                        inactive_text="0"
+                    )
+                    self._last_error = ""
+            except Exception as exc:
+                with self._lock:
+                    self._handle_error_locked(f"PLC 心跳写入失败: {exc}")
+                if self._stop_event.wait(self.RECONNECT_DELAY):
+                    break
+                continue
+
+            if self._stop_event.wait(self.HEARTBEAT_INTERVAL):
+                break
+
+        with self._lock:
+            self._safe_reset_outputs_locked()
+            self._disconnect_locked()
+            self._heartbeat_thread = None
+            self._heartbeat_state = False
+
+    def _ensure_connected_locked(self):
+        if self._client is not None:
+            return
+
+        cfg = self._config
+        client = OpcUaClient(cfg["plc_endpoint"], timeout=4)
+        if cfg.get("plc_security"):
+            client.set_security_string(cfg["plc_security"])
+        if cfg.get("plc_username"):
+            client.set_user(cfg["plc_username"])
+        if cfg.get("plc_password"):
+            client.set_password(cfg["plc_password"])
+
+        client.connect()
+
+        heartbeat_node = client.get_node(cfg["plc_heartbeat_node"])
+        heartbeat_sample = heartbeat_node.read_value()
+        heartbeat_variant_type = heartbeat_node.read_data_type_as_variant_type()
+
+        deleting_node = None
+        deleting_sample = False
+        deleting_variant_type = None
+        if cfg.get("plc_deleting_node"):
+            deleting_node = client.get_node(cfg["plc_deleting_node"])
+            deleting_sample = deleting_node.read_value()
+            deleting_variant_type = deleting_node.read_data_type_as_variant_type()
+
+        self._client = client
+        self._heartbeat_node = heartbeat_node
+        self._heartbeat_sample = heartbeat_sample
+        self._heartbeat_variant_type = heartbeat_variant_type
+        self._deleting_node = deleting_node
+        self._deleting_sample = deleting_sample
+        self._deleting_variant_type = deleting_variant_type
+        self._notify("PLC OPC UA 已连接")
+
+    def _safe_reset_outputs_locked(self):
+        if self._client is None:
+            return
+
+        try:
+            if self._heartbeat_node is not None:
+                self._write_logical_value_locked(
+                    node=self._heartbeat_node,
+                    variant_type=self._heartbeat_variant_type,
+                    sample_value=self._heartbeat_sample,
+                    state=False,
+                    active_text="1",
+                    inactive_text="0"
+                )
+        except Exception:
+            pass
+
+        try:
+            if self._deleting_node is not None:
+                self._write_logical_value_locked(
+                    node=self._deleting_node,
+                    variant_type=self._deleting_variant_type,
+                    sample_value=self._deleting_sample,
+                    state=False,
+                    active_text="deleting",
+                    inactive_text="idle"
+                )
+        except Exception:
+            pass
+
+    def _disconnect_locked(self):
+        if self._client is not None:
+            try:
+                self._client.disconnect()
+            except Exception:
+                pass
+        self._client = None
+        self._heartbeat_node = None
+        self._deleting_node = None
+        self._heartbeat_variant_type = None
+        self._deleting_variant_type = None
+
+    def _write_logical_value_locked(self, node, variant_type, sample_value, state: bool,
+                                    active_text: str, inactive_text: str):
+        value = self._build_value(variant_type, sample_value, state, active_text, inactive_text)
+        node.write_value(value, variant_type)
+
+    def _build_value(self, variant_type, sample_value, state: bool,
+                     active_text: str, inactive_text: str):
+        if HAS_OPCUA and variant_type == ua.VariantType.Boolean:
+            return bool(state)
+        if HAS_OPCUA and variant_type in {
+            ua.VariantType.SByte,
+            ua.VariantType.Byte,
+            ua.VariantType.Int16,
+            ua.VariantType.UInt16,
+            ua.VariantType.Int32,
+            ua.VariantType.UInt32,
+            ua.VariantType.Int64,
+            ua.VariantType.UInt64,
+        }:
+            return 1 if state else 0
+        if HAS_OPCUA and variant_type in {ua.VariantType.Float, ua.VariantType.Double}:
+            return 1.0 if state else 0.0
+        if HAS_OPCUA and variant_type == ua.VariantType.ByteString:
+            return (active_text if state else inactive_text).encode("utf-8")
+        if HAS_OPCUA and variant_type == ua.VariantType.String:
+            return active_text if state else inactive_text
+
+        if isinstance(sample_value, bool):
+            return bool(state)
+        if isinstance(sample_value, int):
+            return 1 if state else 0
+        if isinstance(sample_value, float):
+            return 1.0 if state else 0.0
+        if isinstance(sample_value, (bytes, bytearray)):
+            return (active_text if state else inactive_text).encode("utf-8")
+        if isinstance(sample_value, str):
+            return active_text if state else inactive_text
+        return bool(state)
+
+    def _handle_error_locked(self, message: str):
+        if message != self._last_error:
+            self._last_error = message
+            self._notify(message)
+        self._disconnect_locked()
+
+    def _notify(self, text: str):
+        if text:
+            self.status_callback(text)
+
+    def _snapshot_config(self) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._config)
+
+    @staticmethod
+    def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "plc_enabled": bool(config.get("plc_enabled")),
+            "plc_endpoint": str(config.get("plc_endpoint", "")).strip(),
+            "plc_username": str(config.get("plc_username", "")).strip(),
+            "plc_password": str(config.get("plc_password", "")),
+            "plc_security": str(config.get("plc_security", "")).strip(),
+            "plc_heartbeat_node": str(config.get("plc_heartbeat_node", "")).strip(),
+            "plc_deleting_node": str(config.get("plc_deleting_node", "")).strip(),
+        }
+
+
 # ==========================================
 # 核心逻辑类
 # ==========================================
 class DiskCleanerCore:
-    def __init__(self):
+    def __init__(self, plc_client: Optional[OpcUaSignalClient] = None):
         self.scheduler = None
         self.task_running = False
+        self.plc_client = plc_client
         if HAS_SCHEDULER:
             self.scheduler = BackgroundScheduler()
         else:
             self.scheduler = None
+
+    def set_plc_client(self, plc_client: OpcUaSignalClient):
+        self.plc_client = plc_client
 
     def get_disk_free_gb(self, disk_path: str) -> float:
         try:
@@ -71,6 +355,8 @@ class DiskCleanerCore:
 
         deleted_files_log = []
 
+        deleting_signal_active = False
+
         try:
             files = [f for f in folder_path.iterdir() if f.is_file()]
             if not files:
@@ -83,6 +369,10 @@ class DiskCleanerCore:
             log_file = Path(log_path)
             if log_file.parent and not log_file.parent.exists():
                 log_file.parent.mkdir(parents=True, exist_ok=True)
+
+            if self.plc_client:
+                self.plc_client.set_deleting(True)
+                deleting_signal_active = True
 
             with open(log_file, "a", encoding="utf-8") as log:
                 header = f"\n===== [Triggered] at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} =====\n"
@@ -102,6 +392,9 @@ class DiskCleanerCore:
         except Exception as e:
             print(f"清理过程出错: {e}")
             return [f"系统错误: {e}"]
+        finally:
+            if deleting_signal_active and self.plc_client:
+                self.plc_client.set_deleting(False)
 
         return deleted_files_log
 
@@ -176,8 +469,8 @@ class CleanerApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("磁盘空间智能清理工具 Pro (Live)")
-        self.minsize(720, 720)
-        self.center_window(720, 720)
+        self.minsize(760, 900)
+        self.center_window(760, 900)
 
         self.core = DiskCleanerCore()
         self.config = self.load_config()
@@ -189,8 +482,11 @@ class CleanerApp(tk.Tk):
         self.attributes("-alpha", self.config.get("alpha", 0.98))
 
         self.setup_ui_variables()
+        self.plc_client = OpcUaSignalClient(self.update_status_safe)
+        self.core.set_plc_client(self.plc_client)
         self.build_ui()
         self.load_settings_to_ui()
+        self.refresh_plc_connection(show_status=False)
 
         # 自动倒计时启动监控
         self.auto_start_seconds = 30
@@ -254,7 +550,14 @@ class CleanerApp(tk.Tk):
             "days": [0] * 7, "hour": 2, "minute": 0, "disk": "C:/",
             "threshold": 100.0, "folder": "", "delete_n": 10,
             "log_path": str(Path.cwd() / "cleaner_log.txt"),
-            "alpha": 0.98, "theme": "dark"
+            "alpha": 0.98, "theme": "dark",
+            "plc_enabled": False,
+            "plc_endpoint": "",
+            "plc_username": "",
+            "plc_password": "",
+            "plc_security": "",
+            "plc_heartbeat_node": "",
+            "plc_deleting_node": "",
         }
         if CONFIG_FILE.exists():
             try:
@@ -290,6 +593,13 @@ class CleanerApp(tk.Tk):
         self.status_var = tk.StringVar(value="准备就绪")
         self.alpha_var = tk.DoubleVar(value=self.config.get("alpha", 0.98))
         self.theme_var = tk.StringVar(value=self.config.get("theme", "dark"))
+        self.plc_enabled_var = tk.IntVar(value=1 if self.config.get("plc_enabled") else 0)
+        self.plc_endpoint_var = tk.StringVar(value=self.config.get("plc_endpoint", ""))
+        self.plc_username_var = tk.StringVar(value=self.config.get("plc_username", ""))
+        self.plc_password_var = tk.StringVar(value=self.config.get("plc_password", ""))
+        self.plc_security_var = tk.StringVar(value=self.config.get("plc_security", ""))
+        self.plc_heartbeat_node_var = tk.StringVar(value=self.config.get("plc_heartbeat_node", ""))
+        self.plc_deleting_node_var = tk.StringVar(value=self.config.get("plc_deleting_node", ""))
 
     def load_settings_to_ui(self):
         cfg = self.config
@@ -302,6 +612,13 @@ class CleanerApp(tk.Tk):
         self.folder_var.set(cfg["folder"])
         self.delete_var.set(cfg["delete_n"])
         self.log_var.set(cfg["log_path"])
+        self.plc_enabled_var.set(1 if cfg.get("plc_enabled") else 0)
+        self.plc_endpoint_var.set(cfg.get("plc_endpoint", ""))
+        self.plc_username_var.set(cfg.get("plc_username", ""))
+        self.plc_password_var.set(cfg.get("plc_password", ""))
+        self.plc_security_var.set(cfg.get("plc_security", ""))
+        self.plc_heartbeat_node_var.set(cfg.get("plc_heartbeat_node", ""))
+        self.plc_deleting_node_var.set(cfg.get("plc_deleting_node", ""))
 
     # ====================== UI 构建 ======================
     def build_ui(self):
@@ -362,6 +679,47 @@ class CleanerApp(tk.Tk):
         ttk.Entry(path_frame, textvariable=self.log_var).grid(row=1, column=1, sticky=tk.EW, padx=5, pady=5)
         ttk.Button(path_frame, text="...", width=3, command=self.choose_log).grid(row=1, column=2)
         ttk.Button(path_frame, text="打开", width=5, command=self.open_log).grid(row=1, column=3, padx=(2, 0))
+
+        plc_frame = ttk.LabelFrame(main_container, text="PLC / OPC UA", padding=10)
+        plc_frame.pack(fill=tk.X, pady=(0, 10))
+        plc_frame.columnconfigure(1, weight=1)
+        plc_frame.columnconfigure(3, weight=1)
+
+        ttk.Checkbutton(plc_frame, text="启用 PLC 通信", variable=self.plc_enabled_var).grid(
+            row=0, column=0, columnspan=2, sticky=tk.W, pady=(0, 5)
+        )
+        ttk.Button(plc_frame, text="重连 PLC", command=self.on_plc_reconnect).grid(
+            row=0, column=3, sticky=tk.E, pady=(0, 5)
+        )
+
+        ttk.Label(plc_frame, text="Endpoint:").grid(row=1, column=0, sticky=tk.W)
+        ttk.Entry(plc_frame, textvariable=self.plc_endpoint_var).grid(
+            row=1, column=1, columnspan=3, sticky=tk.EW, padx=5, pady=5
+        )
+
+        ttk.Label(plc_frame, text="Heartbeat NodeId:").grid(row=2, column=0, sticky=tk.W)
+        ttk.Entry(plc_frame, textvariable=self.plc_heartbeat_node_var).grid(
+            row=2, column=1, columnspan=3, sticky=tk.EW, padx=5, pady=5
+        )
+
+        ttk.Label(plc_frame, text="Deleting NodeId:").grid(row=3, column=0, sticky=tk.W)
+        ttk.Entry(plc_frame, textvariable=self.plc_deleting_node_var).grid(
+            row=3, column=1, columnspan=3, sticky=tk.EW, padx=5, pady=5
+        )
+
+        ttk.Label(plc_frame, text="用户名:").grid(row=4, column=0, sticky=tk.W)
+        ttk.Entry(plc_frame, textvariable=self.plc_username_var).grid(
+            row=4, column=1, sticky=tk.EW, padx=5, pady=5
+        )
+        ttk.Label(plc_frame, text="密码:").grid(row=4, column=2, sticky=tk.W)
+        ttk.Entry(plc_frame, textvariable=self.plc_password_var, show="*").grid(
+            row=4, column=3, sticky=tk.EW, padx=5, pady=5
+        )
+
+        ttk.Label(plc_frame, text="Security String:").grid(row=5, column=0, sticky=tk.W)
+        ttk.Entry(plc_frame, textvariable=self.plc_security_var).grid(
+            row=5, column=1, columnspan=3, sticky=tk.EW, padx=5, pady=5
+        )
 
         # 底部操作栏
         act_frame = ttk.Frame(main_container)
@@ -427,13 +785,31 @@ class CleanerApp(tk.Tk):
             "folder": self.folder_var.get(),
             "delete_n": self.delete_var.get(),
             "log_path": self.log_var.get(),
+            "plc_enabled": bool(self.plc_enabled_var.get()),
+            "plc_endpoint": self.plc_endpoint_var.get().strip(),
+            "plc_username": self.plc_username_var.get().strip(),
+            "plc_password": self.plc_password_var.get(),
+            "plc_security": self.plc_security_var.get().strip(),
+            "plc_heartbeat_node": self.plc_heartbeat_node_var.get().strip(),
+            "plc_deleting_node": self.plc_deleting_node_var.get().strip(),
         }
 
     def update_status_safe(self, text):
         self.after(0, lambda: self.status_var.set(text))
 
+    def refresh_plc_connection(self, show_status: bool = True):
+        self.plc_client.reconfigure(self.get_current_config())
+        success, msg = self.plc_client.start()
+        if show_status and msg:
+            self.update_status_safe(msg)
+        return success, msg
+
+    def on_plc_reconnect(self):
+        self.refresh_plc_connection(show_status=True)
+
     def on_run_now(self):
         self.cancel_auto_start()
+        self.refresh_plc_connection(show_status=False)
 
         cfg = self.get_current_config()
         if not os.path.isdir(cfg["folder"]):
@@ -456,6 +832,7 @@ class CleanerApp(tk.Tk):
 
     def on_start_click(self):
         self.cancel_auto_start(silent=True)
+        self.refresh_plc_connection(show_status=False)
         cfg = self.get_current_config()
         success, msg = self.core.start_scheduler(cfg, self.update_status_safe)
         self.status_var.set(msg)
@@ -469,6 +846,7 @@ class CleanerApp(tk.Tk):
         self.btn_start.state(["!disabled"])
 
     def on_closing(self):
+        self.plc_client.stop()
         self.core.stop_scheduler()
         self.save_config()
         self.destroy()
